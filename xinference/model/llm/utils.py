@@ -114,6 +114,22 @@ class ChatModelMixin:
                 else:
                     ret += role
             return ret
+        elif prompt_style.style_name == "LLAMA3":
+            ret = (
+                f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>"
+                f"{prompt_style.intra_message_sep}{prompt_style.system_prompt}{prompt_style.inter_message_sep}"
+            )
+            for i, message in enumerate(chat_history):
+                role = get_role(message["role"])
+                content = message["content"]
+                if content:
+                    ret += (
+                        f"<|start_header_id|>{role}<|end_header_id|>"
+                        f"{prompt_style.intra_message_sep}{content}{prompt_style.inter_message_sep}"
+                    )
+                else:
+                    ret += f"<|start_header_id|>{role}<|end_header_id|>{prompt_style.intra_message_sep}"
+            return ret
         elif prompt_style.style_name == "FALCON":
             ret = prompt_style.system_prompt
             for message in chat_history:
@@ -163,7 +179,7 @@ class ChatModelMixin:
 
             for i, message in enumerate(chat_history):
                 role = get_role(message["role"])
-                content = message["content"]
+                content = message.get("content")
                 tool_calls = message.get("tool_calls")
                 if tool_calls:
                     content = tool_calls[0]["function"]
@@ -212,16 +228,14 @@ Begin!"""
                 tools_name_text = []
                 for func_info in tools:
                     parameters = []
-                    required_parameters = func_info["function"]["parameters"].get(
-                        "required", []
-                    )
-                    for name, p in func_info["function"]["parameters"][
-                        "properties"
-                    ].items():
-                        param = dict({"name": name}, **p)
-                        if name in required_parameters:
-                            param["required"] = True
-                        parameters.append(param)
+                    fp = func_info["function"].get("parameters", {})
+                    if fp:
+                        required_parameters = fp.get("required", [])
+                        for name, p in fp["properties"].items():
+                            param = dict({"name": name}, **p)
+                            if name in required_parameters:
+                                param["required"] = True
+                            parameters.append(param)
 
                     name = func_info["function"]["name"]
                     desc = func_info["function"]["description"]
@@ -248,7 +262,7 @@ Begin!"""
             ret = f"<|im_start|>system\n{prompt_style.system_prompt}<|im_end|>"
             for message in chat_history:
                 role = get_role(message["role"])
-                content = message["content"]
+                content = message.get("content")
 
                 ret += prompt_style.intra_message_sep
                 if tools:
@@ -431,6 +445,17 @@ Begin!"""
                 else:
                     ret += "<AI>" + content.strip()
             return ret
+        elif prompt_style.style_name == "PHI3":
+            ret = f"<|system|>{prompt_style.intra_message_sep}{prompt_style.system_prompt}{prompt_style.inter_message_sep}"
+            for message in chat_history:
+                content = message["content"] or ""
+                role = get_role(message["role"])
+                if content:
+                    ret += f"<|{role}|>{prompt_style.intra_message_sep}{content}{prompt_style.inter_message_sep}"
+                else:
+                    ret += f"<|{role}|>{prompt_style.intra_message_sep}"
+            ret += "<|assistant|>\n"
+            return ret
         else:
             raise ValueError(f"Invalid prompt style: {prompt_style.style_name}")
 
@@ -446,6 +471,11 @@ Begin!"""
                     "index": i,
                     "delta": {
                         "content": choice["text"],
+                        **(
+                            {"tool_calls": choice["tool_calls"]}
+                            if "tool_calls" in choice
+                            else {}
+                        ),
                     },
                     "finish_reason": choice["finish_reason"],
                 }
@@ -592,8 +622,7 @@ Begin!"""
         return text, None, None
 
     @classmethod
-    def _tool_calls_completion(cls, model_family, model_uid, c, tools):
-        _id = str(uuid.uuid4())
+    def _eval_tool_arguments(cls, model_family, c, tools):
         family = model_family.model_family or model_family.model_name
         if family in ["gorilla-openfunctions-v1", "gorilla-openfunctions-v2"]:
             content, func, args = cls._eval_gorilla_openfunctions_arguments(c, tools)
@@ -606,7 +635,41 @@ Begin!"""
                 f"Model {model_family.model_name} is not support tool calls."
             )
         logger.debug("Tool call content: %s, func: %s, args: %s", content, func, args)
+        return content, func, args
 
+    @classmethod
+    def _tools_token_filter(cls, model_family):
+        """
+        Generates a filter function for Qwen series models to retain outputs after "\nFinal Answer:".
+
+        Returns:
+            A function that takes tokens (string output by the model so far) as input
+            returns True if current token is after "\nFinal Answer:", else False.
+        """
+        family = model_family.model_family or model_family.model_name
+        if family in ["qwen-chat", "qwen1.5-chat"]:
+            # Encapsulating function to reset 'found' after each call
+            found = False
+
+            def process_token(tokens: str):
+                nonlocal found
+                # Once "Final Answer:" is found, future tokens are allowed.
+                if found:
+                    return True
+                # Check if the token ends with "\nFinal Answer:" and update `found`.
+                if tokens.endswith("\nFinal Answer:"):
+                    found = True
+                return False
+
+            return process_token
+        else:
+            # For other families, allow all tokens.
+            return lambda tokens: True
+
+    @classmethod
+    def _tool_calls_completion(cls, model_family, model_uid, c, tools):
+        _id = str(uuid.uuid4())
+        content, func, args = cls._eval_tool_arguments(model_family, c, tools)
         if func:
             m = {
                 "role": "assistant",
@@ -626,6 +689,15 @@ Begin!"""
         else:
             m = {"role": "assistant", "content": content, "tool_calls": []}
             finish_reason = "stop"
+        try:
+            usage = c.get("usage")
+            assert "prompt_tokens" in usage
+        except Exception:
+            usage = {
+                "prompt_tokens": -1,
+                "completion_tokens": -1,
+                "total_tokens": -1,
+            }
         return {
             "id": "chat" + f"cmpl-{_id}",
             "model": model_uid,
@@ -638,11 +710,7 @@ Begin!"""
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": -1,
-                "completion_tokens": -1,
-                "total_tokens": -1,
-            },
+            "usage": usage,
         }
 
 

@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os.path
+import tempfile
 
 import pytest
 import requests
 
 
+@pytest.mark.skip(reason="Too large model to be tested")
 def test_restful_api_for_whisper(setup):
     endpoint, _ = setup
     from ....client import Client
@@ -76,3 +78,131 @@ def test_restful_api_for_whisper(setup):
         assert "list" in translation
         assert "airlines" in translation
         assert "hong kong" in translation
+
+
+@pytest.mark.skip(reason="Too large model to be tested")
+def test_transcriptions_for_whisper(setup):
+    endpoint, _ = setup
+    from ....client import Client
+
+    client = Client(endpoint)
+
+    model_uid = client.launch_model(
+        model_uid="whisper-1",
+        model_name="whisper-large-v3",
+        model_type="audio",
+    )
+    model = client.get_model(model_uid)
+    response = requests.get("https://github.com/openai/whisper/raw/main/tests/jfk.flac")
+    audio = response.content
+
+    response = model.transcriptions(audio, response_format="verbose_json")
+    assert response["text"]
+    assert len(response["segments"]) == 3
+
+    seek_set = set()
+    for s in response["segments"]:
+        if s["seek"] in seek_set:
+            assert False, "incorrect seek"
+        seek_set.add(s["seek"])
+
+    response = model.transcriptions(
+        audio, response_format="verbose_json", timestamp_granularities=["word"]
+    )
+    assert response["text"]
+    assert len(response["words"]) == 22
+
+    zh_cn_audio_path = os.path.join(
+        os.path.dirname(__file__), "common_voice_zh-CN_38026095.mp3"
+    )
+
+    # Test openai API
+    import openai
+
+    client = openai.Client(api_key="not empty", base_url=f"{endpoint}/v1")
+    with open(zh_cn_audio_path, "rb") as f:
+        completion = client.audio.transcriptions.create(
+            model=model_uid,
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+        assert len(completion.segments) == 1
+
+        completion = client.audio.transcriptions.create(
+            model=model_uid,
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
+        )
+        assert len(completion.words) == 11
+
+
+def test_register_custom_audio():
+    from ..custom import (
+        CustomAudioModelFamilyV1,
+        get_user_defined_audios,
+        register_audio,
+        unregister_audio,
+    )
+
+    # correct
+    family_a = CustomAudioModelFamilyV1(
+        model_family="my-whisper",
+        model_name="custom_test_a",
+        model_id="test/custom_test_a",
+        multilingual=True,
+    )
+
+    register_audio(family_a, False)
+    assert family_a in get_user_defined_audios()
+
+    # name conflict
+    family_b = CustomAudioModelFamilyV1(
+        model_family="my-whisper",
+        model_name="custom_test_b",
+        model_id="test/custom_test_b",
+        multilingual=True,
+    )
+    register_audio(family_b, False)
+    assert family_b in get_user_defined_audios()
+    with pytest.raises(ValueError):
+        register_audio(family_b, False)
+
+    # unregister
+    unregister_audio(family_a.model_name)
+    assert family_a not in get_user_defined_audios()
+    unregister_audio(family_b.model_name)
+    assert family_b not in get_user_defined_audios()
+
+
+def test_persistent_custom_audio():
+    from ....constants import XINFERENCE_MODEL_DIR
+    from ..custom import (
+        CustomAudioModelFamilyV1,
+        get_user_defined_audios,
+        register_audio,
+        unregister_audio,
+    )
+
+    temp_dir = tempfile.mkdtemp()
+
+    # correct
+    family = CustomAudioModelFamilyV1(
+        model_family="my-whisper",
+        model_name="custom_test_a",
+        model_id="test/custom_test_a",
+        multilingual=True,
+        model_uri=os.path.abspath(temp_dir),
+    )
+
+    register_audio(family, True)
+    assert family in get_user_defined_audios()
+    assert f"{family.model_name}.json" in os.listdir(
+        os.path.join(XINFERENCE_MODEL_DIR, "audio")
+    )
+
+    unregister_audio(family.model_name)
+    assert f"{family.model_name}.json" not in os.listdir(
+        os.path.join(XINFERENCE_MODEL_DIR, "audio")
+    )

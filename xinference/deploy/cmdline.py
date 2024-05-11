@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import click
 from xoscar.utils import get_next_port
@@ -599,6 +599,13 @@ def list_model_registrations(
     help="Specify type of model, LLM as default.",
 )
 @click.option(
+    "--model-engine",
+    "-en",
+    type=str,
+    default=None,
+    help="Specify the inference engine of the model when launching LLM.",
+)
+@click.option(
     "--model-uid",
     "-u",
     type=str,
@@ -640,10 +647,11 @@ def list_model_registrations(
     help='The number of GPUs used by the model, default is "auto".',
 )
 @click.option(
-    "--peft-model-path",
-    default=None,
-    type=str,
-    help="PEFT model path.",
+    "--lora-modules",
+    "-lm",
+    multiple=True,
+    type=(str, str),
+    help="LoRA module configurations in the format name=path. Multiple modules can be specified.",
 )
 @click.option(
     "--image-lora-load-kwargs",
@@ -690,13 +698,14 @@ def model_launch(
     endpoint: Optional[str],
     model_name: str,
     model_type: str,
+    model_engine: Optional[str],
     model_uid: str,
     size_in_billions: str,
     model_format: str,
     quantization: str,
     replica: int,
     n_gpu: str,
-    peft_model_path: Optional[str],
+    lora_modules: Optional[Tuple],
     image_lora_load_kwargs: Optional[Tuple],
     image_lora_fuse_kwargs: Optional[Tuple],
     worker_ip: Optional[str],
@@ -710,6 +719,9 @@ def model_launch(
             raise ValueError("You must specify extra kwargs with `--` prefix.")
         kwargs[ctx.args[i][2:]] = handle_click_args_type(ctx.args[i + 1])
     print(f"Launch model name: {model_name} with kwargs: {kwargs}", file=sys.stderr)
+
+    if model_type == "LLM" and model_engine is None:
+        raise ValueError("--model-engine is required for LLM models.")
 
     if n_gpu.lower() == "none":
         _n_gpu: Optional[Union[int, str]] = None
@@ -729,6 +741,22 @@ def model_launch(
         else None
     )
 
+    lora_list = (
+        [{"lora_name": k, "local_path": v} for k, v in dict(lora_modules).items()]
+        if lora_modules
+        else []
+    )
+
+    peft_model_config = (
+        {
+            "image_lora_load_kwargs": image_lora_load_params,
+            "image_lora_fuse_kwargs": image_lora_fuse_params,
+            "lora_list": lora_list,
+        }
+        if lora_list or image_lora_load_params or image_lora_fuse_params
+        else None
+    )
+
     _gpu_idx: Optional[List[int]] = (
         None if gpu_idx is None else [int(idx) for idx in gpu_idx.split(",")]
     )
@@ -736,7 +764,9 @@ def model_launch(
     endpoint = get_endpoint(endpoint)
     model_size: Optional[Union[str, int]] = (
         size_in_billions
-        if size_in_billions is None or "_" in size_in_billions
+        if size_in_billions is None
+        or "_" in size_in_billions
+        or "." in size_in_billions
         else int(size_in_billions)
     )
     client = RESTfulClient(base_url=endpoint, api_key=api_key)
@@ -746,15 +776,14 @@ def model_launch(
     model_uid = client.launch_model(
         model_name=model_name,
         model_type=model_type,
+        model_engine=model_engine,
         model_uid=model_uid,
         model_size_in_billions=model_size,
         model_format=model_format,
         quantization=quantization,
         replica=replica,
         n_gpu=_n_gpu,
-        peft_model_path=peft_model_path,
-        image_lora_load_kwargs=image_lora_load_params,
-        image_lora_fuse_kwargs=image_lora_fuse_params,
+        peft_model_config=peft_model_config,
         worker_ip=worker_ip,
         gpu_idx=_gpu_idx,
         trust_remote_code=trust_remote_code,
@@ -1184,6 +1213,159 @@ def cluster_login(
         hashed_ep = get_hash_endpoint(endpoint)
         with open(os.path.join(XINFERENCE_AUTH_DIR, hashed_ep), "w") as f:
             f.write(access_token)
+
+
+@cli.command(name="engine", help="Query the applicable inference engine by model name.")
+@click.option(
+    "--model-name",
+    "-n",
+    type=str,
+    required=True,
+    help="The model name you want to query.",
+)
+@click.option(
+    "--model-engine",
+    "-en",
+    type=str,
+    default=None,
+    help="Specify the `model_engine` to query the corresponding combination of other parameters.",
+)
+@click.option(
+    "--model-format",
+    "-f",
+    type=str,
+    default=None,
+    help="Specify the `model_format` to query the corresponding combination of other parameters.",
+)
+@click.option(
+    "--model-size-in-billions",
+    "-s",
+    type=str,
+    default=None,
+    help="Specify the `model_size_in_billions` to query the corresponding combination of other parameters.",
+)
+@click.option(
+    "--quantization",
+    "-q",
+    type=str,
+    default=None,
+    help="Specify the `quantization` to query the corresponding combination of other parameters.",
+)
+@click.option("--endpoint", "-e", type=str, help="Xinference endpoint.")
+@click.option(
+    "--api-key",
+    "-ak",
+    default=None,
+    type=str,
+    help="Api-Key for access xinference api with authorization.",
+)
+def query_engine_by_model_name(
+    model_name: str,
+    model_engine: Optional[str],
+    model_format: Optional[str],
+    model_size_in_billions: Optional[Union[str, int]],
+    quantization: Optional[str],
+    endpoint: Optional[str],
+    api_key: Optional[str],
+):
+    from tabulate import tabulate
+
+    def match_engine_from_spell(value: str, target: Sequence[str]) -> Tuple[bool, str]:
+        """
+        For better usage experience.
+        """
+        for t in target:
+            if value.lower() == t.lower():
+                return True, t
+        return False, value
+
+    def handle_user_passed_parameters() -> List[str]:
+        user_specified_parameters = []
+        if model_engine is not None:
+            user_specified_parameters.append(f"--model-engine {model_engine}")
+        if model_format is not None:
+            user_specified_parameters.append(f"--model-format {model_format}")
+        if model_size_in_billions is not None:
+            user_specified_parameters.append(
+                f"--model-size-in-billions {model_size_in_billions}"
+            )
+        if quantization is not None:
+            user_specified_parameters.append(f"--quantization {quantization}")
+        return user_specified_parameters
+
+    user_specified_params = handle_user_passed_parameters()
+
+    endpoint = get_endpoint(endpoint)
+    client = RESTfulClient(base_url=endpoint, api_key=api_key)
+    if api_key is None:
+        client._set_token(get_stored_token(endpoint, client))
+
+    llm_engines = client.query_engine_by_model_name(model_name)
+    if model_engine is not None:
+        is_matched, model_engine = match_engine_from_spell(
+            model_engine, list(llm_engines.keys())
+        )
+        if not is_matched:
+            print(
+                f'Xinference does not support this inference engine "{model_engine}".',
+                file=sys.stderr,
+            )
+            return
+
+    table = []
+    engines = [model_engine] if model_engine is not None else list(llm_engines.keys())
+    for engine in engines:
+        params = llm_engines[engine]
+        for param in params:
+            if (
+                (model_format is None or model_format == param["model_format"])
+                and (
+                    model_size_in_billions is None
+                    or model_size_in_billions == str(param["model_size_in_billions"])
+                )
+                and (quantization is None or quantization in param["quantizations"])
+            ):
+                if quantization is not None:
+                    table.append(
+                        [
+                            model_name,
+                            engine,
+                            param["model_format"],
+                            param["model_size_in_billions"],
+                            quantization,
+                        ]
+                    )
+                else:
+                    for quant in param["quantizations"]:
+                        table.append(
+                            [
+                                model_name,
+                                engine,
+                                param["model_format"],
+                                param["model_size_in_billions"],
+                                quant,
+                            ]
+                        )
+    if len(table) == 0:
+        print(
+            f"Xinference does not support "
+            f"your provided params: {', '.join(user_specified_params)} for the model {model_name}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            tabulate(
+                table,
+                headers=[
+                    "Name",
+                    "Engine",
+                    "Format",
+                    "Size (in billions)",
+                    "Quantization",
+                ],
+            ),
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

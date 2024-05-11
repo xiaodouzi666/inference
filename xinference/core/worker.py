@@ -34,8 +34,9 @@ from ..constants import (
 )
 from ..core import ModelActor
 from ..core.status_guard import LaunchStatus
-from ..device_utils import gpu_count
+from ..device_utils import get_available_device_env_name, gpu_count
 from ..model.core import ModelDescription, create_model_instance
+from ..types import PeftModelConfig
 from .event import Event, EventCollectorActor, EventType
 from .metrics import launch_metrics_export_server, record_metrics
 from .resource import gather_node_info
@@ -79,7 +80,7 @@ class WorkerActor(xo.StatelessActor):
             int, Set[Tuple[str, str]]
         ] = defaultdict(set)
         self._model_uid_to_addr: Dict[str, str] = {}
-        self._model_uid_to_recover_count: Dict[str, int] = {}
+        self._model_uid_to_recover_count: Dict[str, Optional[int]] = {}
         self._model_uid_to_launch_args: Dict[str, Dict] = {}
 
         # metrics export server.
@@ -136,14 +137,19 @@ class WorkerActor(xo.StatelessActor):
                                 recover_count - 1,
                             )
                             event_model_uid, _, __ = parse_replica_model_uid(model_uid)
-                            await self._event_collector_ref.report_event(
-                                event_model_uid,
-                                Event(
-                                    event_type=EventType.WARNING,
-                                    event_ts=int(time.time()),
-                                    event_content="Recreate model",
-                                ),
-                            )
+                            try:
+                                await self._event_collector_ref.report_event(
+                                    event_model_uid,
+                                    Event(
+                                        event_type=EventType.WARNING,
+                                        event_ts=int(time.time()),
+                                        event_content="Recreate model",
+                                    ),
+                                )
+                            except Exception as e:
+                                # Report callback error can be log and ignore, should not interrupt the Process
+                                logger.error("report_event error: %s" % (e))
+
                             self._model_uid_to_recover_count[model_uid] = (
                                 recover_count - 1
                             )
@@ -165,22 +171,22 @@ class WorkerActor(xo.StatelessActor):
         from .status_guard import StatusGuardActor
         from .supervisor import SupervisorActor
 
-        self._status_guard_ref: xo.ActorRefType[
+        self._status_guard_ref: xo.ActorRefType[  # type: ignore
             "StatusGuardActor"
         ] = await xo.actor_ref(
             address=self._supervisor_address, uid=StatusGuardActor.uid()
         )
-        self._event_collector_ref: xo.ActorRefType[
+        self._event_collector_ref: xo.ActorRefType[  # type: ignore
             EventCollectorActor
         ] = await xo.actor_ref(
             address=self._supervisor_address, uid=EventCollectorActor.uid()
         )
-        self._cache_tracker_ref: xo.ActorRefType[
+        self._cache_tracker_ref: xo.ActorRefType[  # type: ignore
             "CacheTrackerActor"
         ] = await xo.actor_ref(
             address=self._supervisor_address, uid=CacheTrackerActor.uid()
         )
-        self._supervisor_ref: xo.ActorRefType["SupervisorActor"] = await xo.actor_ref(
+        self._supervisor_ref: xo.ActorRefType["SupervisorActor"] = await xo.actor_ref(  # type: ignore
             address=self._supervisor_address, uid=SupervisorActor.uid()
         )
         await self._supervisor_ref.add_worker(self.address)
@@ -195,13 +201,24 @@ class WorkerActor(xo.StatelessActor):
         logger.info("Purge cache directory: %s", XINFERENCE_CACHE_DIR)
         purge_dir(XINFERENCE_CACHE_DIR)
 
+        from ..model.audio import (
+            CustomAudioModelFamilyV1,
+            get_audio_model_descriptions,
+            register_audio,
+            unregister_audio,
+        )
         from ..model.embedding import (
             CustomEmbeddingModelSpec,
             get_embedding_model_descriptions,
             register_embedding,
             unregister_embedding,
         )
-        from ..model.image import get_image_model_descriptions
+        from ..model.image import (
+            CustomImageModelFamilyV1,
+            get_image_model_descriptions,
+            register_image,
+            unregister_image,
+        )
         from ..model.llm import (
             CustomLLMFamilyV1,
             get_llm_model_descriptions,
@@ -215,7 +232,7 @@ class WorkerActor(xo.StatelessActor):
             unregister_rerank,
         )
 
-        self._custom_register_type_to_cls: Dict[str, Tuple] = {
+        self._custom_register_type_to_cls: Dict[str, Tuple] = {  # type: ignore
             "LLM": (CustomLLMFamilyV1, register_llm, unregister_llm),
             "embedding": (
                 CustomEmbeddingModelSpec,
@@ -223,14 +240,21 @@ class WorkerActor(xo.StatelessActor):
                 unregister_embedding,
             ),
             "rerank": (CustomRerankModelSpec, register_rerank, unregister_rerank),
+            "audio": (CustomAudioModelFamilyV1, register_audio, unregister_audio),
+            "image": (
+                CustomImageModelFamilyV1,
+                register_image,
+                unregister_image,
+            ),
         }
 
         # record model version
-        model_version_infos: Dict[str, List[Dict]] = {}
+        model_version_infos: Dict[str, List[Dict]] = {}  # type: ignore
         model_version_infos.update(get_llm_model_descriptions())
         model_version_infos.update(get_embedding_model_descriptions())
         model_version_infos.update(get_rerank_model_descriptions())
         model_version_infos.update(get_image_model_descriptions())
+        model_version_infos.update(get_audio_model_descriptions())
         await self._cache_tracker_ref.record_model_version(
             model_version_infos, self.address
         )
@@ -239,7 +263,11 @@ class WorkerActor(xo.StatelessActor):
         if os.name != "nt":
 
             async def signal_handler():
-                await self._supervisor_ref.remove_worker(self.address)
+                try:
+                    await self._supervisor_ref.remove_worker(self.address)
+                except Exception as e:
+                    # Ignore the error of rpc, anyway we are exiting
+                    logger.exception("remove worker rpc error: %s", e)
                 os._exit(0)
 
             loop = asyncio.get_running_loop()
@@ -428,6 +456,7 @@ class WorkerActor(xo.StatelessActor):
     ) -> Tuple[str, List[str]]:
         env = {}
         devices = []
+        env_name = get_available_device_env_name()
         if gpu_idx is None:
             if isinstance(n_gpu, int) or (n_gpu == "auto" and gpu_count() > 0):
                 # Currently, n_gpu=auto means using 1 GPU
@@ -437,17 +466,17 @@ class WorkerActor(xo.StatelessActor):
                     if model_type in ["embedding", "rerank"]
                     else self.allocate_devices(model_uid=model_uid, n_gpu=gpu_cnt)
                 )
-                env["CUDA_VISIBLE_DEVICES"] = ",".join([str(dev) for dev in devices])
+                env[env_name] = ",".join([str(dev) for dev in devices])
                 logger.debug(f"GPU selected: {devices} for model {model_uid}")
             if n_gpu is None:
-                env["CUDA_VISIBLE_DEVICES"] = "-1"
+                env[env_name] = "-1"
                 logger.debug(f"GPU disabled for model {model_uid}")
         else:
             assert isinstance(gpu_idx, list)
             devices = await self.allocate_devices_with_gpu_idx(
                 model_uid, model_type, gpu_idx  # type: ignore
             )
-            env["CUDA_VISIBLE_DEVICES"] = ",".join([str(dev) for dev in devices])
+            env[env_name] = ",".join([str(dev) for dev in devices])
 
         if os.name != "nt" and platform.system() != "Darwin":
             # Linux
@@ -494,67 +523,6 @@ class WorkerActor(xo.StatelessActor):
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
 
-    @log_async(logger=logger)
-    async def launch_speculative_model(
-        self,
-        model_uid: str,
-        model_name: str,
-        model_size_in_billions: Optional[int],
-        quantization: Optional[str],
-        draft_model_name: str,
-        draft_model_size_in_billions: Optional[int],
-        draft_quantization: Optional[str],
-        n_gpu: Optional[Union[int, str]] = "auto",
-    ):
-        if n_gpu is not None:
-            if isinstance(n_gpu, int) and (n_gpu <= 0 or n_gpu > gpu_count()):
-                raise ValueError(
-                    f"The parameter `n_gpu` must be greater than 0 and "
-                    f"not greater than the number of GPUs: {gpu_count()} on the machine."
-                )
-            if isinstance(n_gpu, str) and n_gpu != "auto":
-                raise ValueError("Currently `n_gpu` only supports `auto`.")
-
-        from ..model.llm.core import create_speculative_llm_model_instance
-
-        subpool_address, devices = await self._create_subpool(model_uid, n_gpu=n_gpu)
-
-        model, model_description = await asyncio.to_thread(
-            create_speculative_llm_model_instance,
-            subpool_addr=subpool_address,
-            devices=devices,
-            model_uid=model_uid,
-            model_name=model_name,
-            model_size_in_billions=model_size_in_billions,
-            quantization=quantization,
-            draft_model_name=draft_model_name,
-            draft_model_size_in_billions=draft_model_size_in_billions,
-            draft_quantization=draft_quantization,
-            is_local_deployment=True,
-        )
-
-        try:
-            model_ref = await xo.create_actor(
-                ModelActor,
-                address=subpool_address,
-                uid=model_uid,
-                worker_address=self.address,
-                model=model,
-                model_description=model_description,
-            )
-            await model_ref.load()
-        except:
-            logger.error(f"Failed to load model {model_uid}", exc_info=True)
-            self.release_devices(model_uid=model_uid)
-            await self._main_pool.remove_sub_pool(subpool_address)
-            raise
-
-        self._model_uid_to_model[model_uid] = model_ref
-        self._model_uid_to_model_spec[model_uid] = model_description
-        for dev in devices:
-            self._gpu_to_model_uid[int(dev)] = model_uid
-        self._model_uid_to_addr[model_uid] = subpool_address
-
     async def _get_model_ability(self, model: Any, model_type: str) -> List[str]:
         from ..model.llm.core import LLM
 
@@ -593,31 +561,38 @@ class WorkerActor(xo.StatelessActor):
         self,
         model_uid: str,
         model_name: str,
-        model_size_in_billions: Optional[int],
+        model_size_in_billions: Optional[Union[int, str]],
         model_format: Optional[str],
         quantization: Optional[str],
+        model_engine: Optional[str],
         model_type: str = "LLM",
         n_gpu: Optional[Union[int, str]] = "auto",
-        peft_model_path: Optional[str] = None,
-        image_lora_load_kwargs: Optional[Dict] = None,
-        image_lora_fuse_kwargs: Optional[Dict] = None,
+        peft_model_config: Optional[PeftModelConfig] = None,
         request_limits: Optional[int] = None,
         gpu_idx: Optional[Union[int, List[int]]] = None,
         **kwargs,
     ):
-        event_model_uid, _, __ = parse_replica_model_uid(model_uid)
-        await self._event_collector_ref.report_event(
-            event_model_uid,
-            Event(
-                event_type=EventType.INFO,
-                event_ts=int(time.time()),
-                event_content="Launch model",
-            ),
-        )
+        # !!! Note that The following code must be placed at the very beginning of this function,
+        # or there will be problems with auto-recovery.
+        # Because `locals()` will collect all the local parameters of this function and pass to this function again.
         launch_args = locals()
         launch_args.pop("self")
         launch_args.pop("kwargs")
         launch_args.update(kwargs)
+
+        event_model_uid, _, __ = parse_replica_model_uid(model_uid)
+        try:
+            await self._event_collector_ref.report_event(
+                event_model_uid,
+                Event(
+                    event_type=EventType.INFO,
+                    event_ts=int(time.time()),
+                    event_content="Launch model",
+                ),
+            )
+        except Exception as e:
+            # Report callback error can be log and ignore, should not interrupt the Process
+            logger.error("report_event error: %s" % (e))
 
         if gpu_idx is not None:
             logger.info(
@@ -638,7 +613,7 @@ class WorkerActor(xo.StatelessActor):
             if isinstance(n_gpu, str) and n_gpu != "auto":
                 raise ValueError("Currently `n_gpu` only supports `auto`.")
 
-        if peft_model_path is not None:
+        if peft_model_config is not None:
             if model_type in ("embedding", "rerank"):
                 raise ValueError(
                     f"PEFT adaptors cannot be applied to embedding or rerank models."
@@ -650,8 +625,6 @@ class WorkerActor(xo.StatelessActor):
 
         assert model_uid not in self._model_uid_to_model
         self._check_model_is_valid(model_name, model_format)
-        assert self._supervisor_ref is not None
-        is_local_deployment = await self._supervisor_ref.is_local_deployment()
 
         subpool_address, devices = await self._create_subpool(
             model_uid, model_type, n_gpu=n_gpu, gpu_idx=gpu_idx
@@ -666,13 +639,11 @@ class WorkerActor(xo.StatelessActor):
                 model_uid,
                 model_type,
                 model_name,
+                model_engine,
                 model_format,
                 model_size_in_billions,
                 quantization,
-                peft_model_path,
-                image_lora_load_kwargs,
-                image_lora_fuse_kwargs,
-                is_local_deployment,
+                peft_model_config,
                 **kwargs,
             )
             await self.update_cache_status(model_name, model_description)
@@ -710,14 +681,19 @@ class WorkerActor(xo.StatelessActor):
     @log_async(logger=logger)
     async def terminate_model(self, model_uid: str):
         event_model_uid, _, __ = parse_replica_model_uid(model_uid)
-        await self._event_collector_ref.report_event(
-            event_model_uid,
-            Event(
-                event_type=EventType.INFO,
-                event_ts=int(time.time()),
-                event_content="Terminate model",
-            ),
-        )
+        try:
+            await self._event_collector_ref.report_event(
+                event_model_uid,
+                Event(
+                    event_type=EventType.INFO,
+                    event_ts=int(time.time()),
+                    event_content="Terminate model",
+                ),
+            )
+        except Exception as e:
+            # Report callback error can be log and ignore, should not interrupt the Process
+            logger.error("report_event error: %s" % (e))
+
         origin_uid, _, _ = parse_replica_model_uid(model_uid)
         await self._status_guard_ref.update_instance_info(
             origin_uid, {"status": LaunchStatus.TERMINATING.name}

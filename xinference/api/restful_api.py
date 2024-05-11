@@ -64,6 +64,7 @@ from ..types import (
     CreateChatCompletion,
     CreateCompletion,
     ImageList,
+    PeftModelConfig,
     max_tokens_field,
 )
 from .oauth2.auth_service import AuthService
@@ -274,6 +275,16 @@ class RESTfulAPI:
         self._router.add_api_route(
             "/v1/cluster/auth", self.is_cluster_authenticated, methods=["GET"]
         )
+        self._router.add_api_route(
+            "/v1/engines/{model_name}",
+            self.query_engines_by_model_name,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:list"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
         # running instances
         self._router.add_api_route(
             "/v1/models/instances",
@@ -339,16 +350,6 @@ class RESTfulAPI:
         self._router.add_api_route(
             "/v1/models",
             self.launch_model,
-            methods=["POST"],
-            dependencies=(
-                [Security(self._auth_service, scopes=["models:start"])]
-                if self.is_authenticated()
-                else None
-            ),
-        )
-        self._router.add_api_route(
-            "/experimental/speculative_llms",
-            self.launch_speculative_llm,
             methods=["POST"],
             dependencies=(
                 [Security(self._auth_service, scopes=["models:start"])]
@@ -638,53 +639,13 @@ class RESTfulAPI:
             logger.error(e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
-    async def launch_speculative_llm(self, request: Request) -> JSONResponse:
-        payload = await request.json()
-        model_uid = payload.get("model_uid")
-        model_name = payload.get("model_name")
-        model_size_in_billions = payload.get("model_size_in_billions")
-        quantization = payload.get("quantization")
-        draft_model_name = payload.get("draft_model_name")
-        draft_model_size_in_billions = payload.get("draft_model_size_in_billions")
-        draft_quantization = payload.get("draft_quantization")
-        n_gpu = payload.get("n_gpu", "auto")
-
-        if not model_name:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input. Please specify the model name",
-            )
-
-        try:
-            model_uid = await (await self._get_supervisor_ref()).launch_speculative_llm(
-                model_uid=model_uid,
-                model_name=model_name,
-                model_size_in_billions=model_size_in_billions,
-                quantization=quantization,
-                draft_model_name=draft_model_name,
-                draft_model_size_in_billions=draft_model_size_in_billions,
-                draft_quantization=draft_quantization,
-                n_gpu=n_gpu,
-            )
-
-        except ValueError as ve:
-            logger.error(str(ve), exc_info=True)
-            raise HTTPException(status_code=400, detail=str(ve))
-        except RuntimeError as re:
-            logger.error(str(re), exc_info=True)
-            raise HTTPException(status_code=503, detail=str(re))
-        except Exception as e:
-            logger.error(str(e), exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-
-        return JSONResponse(content={"model_uid": model_uid})
-
     async def launch_model(
         self, request: Request, wait_ready: bool = Query(True)
     ) -> JSONResponse:
         payload = await request.json()
         model_uid = payload.get("model_uid")
         model_name = payload.get("model_name")
+        model_engine = payload.get("model_engine")
         model_size_in_billions = payload.get("model_size_in_billions")
         model_format = payload.get("model_format")
         quantization = payload.get("quantization")
@@ -692,15 +653,14 @@ class RESTfulAPI:
         replica = payload.get("replica", 1)
         n_gpu = payload.get("n_gpu", "auto")
         request_limits = payload.get("request_limits", None)
-        peft_model_path = payload.get("peft_model_path", None)
-        image_lora_load_kwargs = payload.get("image_lora_load_kwargs", None)
-        image_lora_fuse_kwargs = payload.get("image_lora_fuse_kwargs", None)
+        peft_model_config = payload.get("peft_model_config", None)
         worker_ip = payload.get("worker_ip", None)
         gpu_idx = payload.get("gpu_idx", None)
 
         exclude_keys = {
             "model_uid",
             "model_name",
+            "model_engine",
             "model_size_in_billions",
             "model_format",
             "quantization",
@@ -708,9 +668,7 @@ class RESTfulAPI:
             "replica",
             "n_gpu",
             "request_limits",
-            "peft_model_path",
-            "image_lora_load_kwargs",
-            "image_lora_fuse_kwargs",
+            "peft_model_config",
             "worker_ip",
             "gpu_idx",
         }
@@ -725,10 +683,16 @@ class RESTfulAPI:
                 detail="Invalid input. Please specify the model name",
             )
 
+        if peft_model_config is not None:
+            peft_model_config = PeftModelConfig.from_dict(peft_model_config)
+        else:
+            peft_model_config = None
+
         try:
             model_uid = await (await self._get_supervisor_ref()).launch_builtin_model(
                 model_uid=model_uid,
                 model_name=model_name,
+                model_engine=model_engine,
                 model_size_in_billions=model_size_in_billions,
                 model_format=model_format,
                 quantization=quantization,
@@ -737,9 +701,7 @@ class RESTfulAPI:
                 n_gpu=n_gpu,
                 request_limits=request_limits,
                 wait_ready=wait_ready,
-                peft_model_path=peft_model_path,
-                image_lora_load_kwargs=image_lora_load_kwargs,
-                image_lora_fuse_kwargs=image_lora_fuse_kwargs,
+                peft_model_config=peft_model_config,
                 worker_ip=worker_ip,
                 gpu_idx=gpu_idx,
                 **kwargs,
@@ -776,6 +738,7 @@ class RESTfulAPI:
     ) -> JSONResponse:
         payload = await request.json()
         model_uid = payload.get("model_uid")
+        model_engine = payload.get("model_engine")
         model_type = payload.get("model_type")
         model_version = payload.get("model_version")
         replica = payload.get("replica", 1)
@@ -786,6 +749,7 @@ class RESTfulAPI:
                 await self._get_supervisor_ref()
             ).launch_model_by_version(
                 model_uid=model_uid,
+                model_engine=model_engine,
                 model_type=model_type,
                 model_version=model_version,
                 replica=replica,
@@ -1085,6 +1049,7 @@ class RESTfulAPI:
 
     async def create_transcriptions(
         self,
+        request: Request,
         model: str = Form(...),
         file: UploadFile = File(media_type="application/octet-stream"),
         language: Optional[str] = Form(None),
@@ -1093,6 +1058,10 @@ class RESTfulAPI:
         temperature: Optional[float] = Form(0),
         kwargs: Optional[str] = Form(None),
     ) -> Response:
+        form = await request.form()
+        timestamp_granularities = form.get("timestamp_granularities[]")
+        if timestamp_granularities:
+            timestamp_granularities = [timestamp_granularities]
         model_uid = model
         try:
             model_ref = await (await self._get_supervisor_ref()).get_model(model_uid)
@@ -1116,6 +1085,7 @@ class RESTfulAPI:
                 prompt=prompt,
                 response_format=response_format,
                 temperature=temperature,
+                timestamp_granularities=timestamp_granularities,
                 **parsed_kwargs,
             )
             return Response(content=transcription, media_type="application/json")
@@ -1130,13 +1100,19 @@ class RESTfulAPI:
 
     async def create_translations(
         self,
+        request: Request,
         model: str = Form(...),
         file: UploadFile = File(media_type="application/octet-stream"),
+        language: Optional[str] = Form(None),
         prompt: Optional[str] = Form(None),
         response_format: Optional[str] = Form("json"),
         temperature: Optional[float] = Form(0),
         kwargs: Optional[str] = Form(None),
     ) -> Response:
+        form = await request.form()
+        timestamp_granularities = form.get("timestamp_granularities[]")
+        if timestamp_granularities:
+            timestamp_granularities = [timestamp_granularities]
         model_uid = model
         try:
             model_ref = await (await self._get_supervisor_ref()).get_model(model_uid)
@@ -1156,9 +1132,11 @@ class RESTfulAPI:
                 parsed_kwargs = {}
             translation = await model_ref.translations(
                 audio=await file.read(),
+                language=language,
                 prompt=prompt,
                 response_format=response_format,
                 temperature=temperature,
+                timestamp_granularities=timestamp_granularities,
                 **parsed_kwargs,
             )
             return Response(content=translation, media_type="application/json")
@@ -1274,11 +1252,7 @@ class RESTfulAPI:
 
         messages = body.messages and list(body.messages) or None
 
-        if (
-            not messages
-            or messages[-1].get("role") not in ["user", "system", "tool"]
-            or not messages[-1].get("content")
-        ):
+        if not messages or messages[-1].get("role") not in ["user", "system", "tool"]:
             raise HTTPException(
                 status_code=400, detail="Invalid input. Please specify the prompt."
             )
@@ -1298,15 +1272,15 @@ class RESTfulAPI:
             {"role": "system", "content": ". ".join(system_messages_contents)}
         )
 
-        assert non_system_messages
-
         has_tool_message = messages[-1].get("role") == "tool"
         if has_tool_message:
             prompt = SPECIAL_TOOL_PROMPT
             system_prompt = system_messages[0]["content"] if system_messages else None
             chat_history = non_system_messages  # exclude the prompt
         else:
-            prompt = non_system_messages[-1]["content"]
+            prompt = None
+            if non_system_messages:
+                prompt = non_system_messages[-1]["content"]
             system_prompt = system_messages[0]["content"] if system_messages else None
             chat_history = non_system_messages[:-1]  # exclude the prompt
 
@@ -1361,9 +1335,12 @@ class RESTfulAPI:
                     detail=f"Only {function_call_models} support tool messages",
                 )
         if body.tools and body.stream:
-            raise HTTPException(
-                status_code=400, detail="Tool calls does not support stream"
-            )
+            is_vllm = await model.is_vllm_backend()
+            if not is_vllm or model_family not in ["qwen-chat", "qwen1.5-chat"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Streaming support for tool calls is available only when using vLLM backend and Qwen models.",
+                )
 
         if body.stream:
 
@@ -1414,6 +1391,19 @@ class RESTfulAPI:
                 await self._report_error_event(model_uid, str(e))
                 self.handle_request_limit_error(e)
                 raise HTTPException(status_code=500, detail=str(e))
+
+    async def query_engines_by_model_name(self, model_name: str) -> JSONResponse:
+        try:
+            content = await (
+                await self._get_supervisor_ref()
+            ).query_engines_by_model_name(model_name)
+            return JSONResponse(content=content)
+        except ValueError as re:
+            logger.error(re, exc_info=True)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
     async def register_model(self, model_type: str, request: Request) -> JSONResponse:
         body = RegisterModelRequest.parse_obj(await request.json())
